@@ -1,0 +1,193 @@
+---
+title: "The code behind the talk \"Planifiquemos un Viaje Usando Clustering y Google Maps API\""
+output: html_notebook
+---
+
+# Intro
+This is the code I used to present the material from my lightning talk at latin-R 2024, "Planifiquemos un Viaje Usando Clustering y Google Maps API".
+
+To install the packages listed on the first cell, use `install.packages("name_of_package")`
+
+
+```{r}
+library(dplyr)
+library(cluster)
+library(leaflet)
+library(httr)
+library(jsonlite)
+library(geosphere)
+library(apcluster)
+library(RColorBrewer)
+```
+
+
+```{r}
+locations <- read.csv("data/locations.csv")
+locations$description <- NULL
+```
+
+
+```{r}
+locations <- locations %>%
+  mutate(lat = as.numeric(sub(".*\\(([^ ]+) ([^\\)]+)\\).*", "\\2", WKT)),
+         lon = as.numeric(sub(".*\\(([^ ]+) ([^\\)]+)\\).*", "\\1", WKT)))
+locations$WKT <- NULL
+```
+
+```{r}
+# PAM stands for Partitioning Around Medoids
+euclidean_result <- pam(locations[, c("lat", "lon")], 3, keep.diss = TRUE)
+euclidean_distances_matrix <- euclidean_result$diss
+locations$euclidean_clusters <- euclidean_result$clustering
+```
+
+```{r}
+# Set the color palette for the leaflet visualizations.
+pal <- colorFactor(
+  palette = brewer.pal(3, "Set2"),
+  domain = factor(locations$euclidean_clusters)
+)
+```
+
+
+```{r}
+leaflet(data = locations) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%  
+  addCircleMarkers(
+    ~lon, ~lat,
+    color = "black",
+    fillColor = ~pal(factor(euclidean_clusters)),
+    fillOpacity = 0.9,
+    radius = 12,
+    stroke = TRUE,
+    weight = 1.5,
+    label = ~name,
+    labelOptions = labelOptions(
+      style = list("font-size" = "16px")
+    )
+  ) %>%
+  addControl(
+    html = "<strong>Clustered Locations Based on Euclidean Distance Similarity",
+    position = "topright"
+  )
+```
+
+```{r}
+haversine_distances_matrix <- distm(locations[, c("lon", "lat")], 
+                                    fun = distHaversine) # returned distances are in meters.
+haversine_result <- pam(haversine_distances_matrix, 3, diss = TRUE)
+locations$haversine_clusters <- haversine_result$clustering
+```
+
+```{r}
+pal <- colorFactor(
+  palette = brewer.pal(3, "Set2"),
+  domain = factor(locations$haversine_clusters)
+)
+```
+
+```{r}
+leaflet(data = locations) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%  
+  addCircleMarkers(
+    ~lon, ~lat,
+    color = "black",
+    fillColor = ~pal(factor(haversine_clusters)),
+    fillOpacity = 0.9,
+    radius = 12,
+    stroke = TRUE,
+    weight = 1.5,
+    label = ~name,
+    labelOptions = labelOptions(
+      style = list("font-size" = "16px")
+    )
+  ) %>%
+  addControl(
+    html = "<strong>Clustered Locations Based on Haversine Distance Similarity",
+    position = "topright"
+  )
+```
+
+
+```{r}
+distance_matrix_file <- "data/distance_matrix.csv"
+
+if (file.exists(distance_matrix_file)) {
+  dist_matrix <- as.matrix(read.csv(distance_matrix_file))
+} else {
+  
+  api_key <- "YOUR_API_KEY"
+  
+  # get_driving_distance is a function that takes two set of coordinates, origin and destination,
+  # and gets their driving distance from Google Maps API. It requires an API key.
+  get_driving_distance <- function(origin, destination, api_key) {
+    url <- paste0("https://maps.googleapis.com/maps/api/distancematrix/json?origins=", 
+                  origin, "&destinations=", destination, "&mode=driving&key=", api_key)
+    response <- GET(url) # from httr
+    content <- content(response, as = "text")
+    result <- fromJSON(content)
+    return(result$rows[[1]][[1]]$distance$value)
+  }
+  
+  n <- nrow(locations)
+  dist_matrix <- matrix(0, n, n)
+  
+  # Get get the driving distance for each coordinates pair.
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i != j) {
+        origin <- paste(locations$lat[i], locations$lon[i], sep = ",")
+        destination <- paste(locations$lat[j], locations$lon[j], sep = ",")
+        dist_matrix[i, j] <- get_driving_distance(origin, destination, api_key)
+      }
+    }
+  }
+  # Export the distance matrix to avoid calling the API a second time.
+  write.csv(dist_matrix, distance_matrix_file, row.names = FALSE)
+}
+```
+
+## Affinity propagation clustering with real driving distances
+```{r}
+# Convert the distance matrix to similarities using exponential decay to ensure smaller distances have higher similarities
+# Exclude zero distances (distance from a point to itself)
+# sigma controls the rate at which the similarity decreases with increasing distance
+sigma <- median(dist_matrix[dist_matrix > 0])
+similarity_matrix <- exp(-dist_matrix / sigma)
+
+ap_result <- apcluster(s = similarity_matrix, details = TRUE)
+clusters <- ap_result@idx
+
+# Add cluster assignments to your data
+locations$driving_distance_clusters <- clusters
+
+num_clusters <- length(unique(locations$driving_distance_clusters))
+
+pal <- colorFactor(
+  palette = brewer.pal(num_clusters, "Set2"),
+  domain = factor(locations$driving_distance_clusters)
+)
+```
+
+```{r}
+leaflet(data = locations) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    ~lon, ~lat,
+    color = "black",
+    fillColor = ~pal(factor(driving_distance_clusters)),
+    fillOpacity = 0.9,
+    radius = 12,
+    stroke = TRUE,
+    weight = 1.5,
+    label = ~name,
+    labelOptions = labelOptions(
+      style = list("font-size" = "16px")
+    )
+  ) %>%
+  addControl(
+    html = "<strong>Clustered Locations Using Affinity Propagation</strong>",
+    position = "topright"
+  )
+```
+
